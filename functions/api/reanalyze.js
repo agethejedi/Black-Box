@@ -120,7 +120,7 @@ export async function onRequestPost(context) {
           body: JSON.stringify({
             model: "gpt-4o",
             input: [{ type: "message", role: "user", content: [
-              { type: "input_image", image_url: { url: "data:" + safeMime + ";base64," + base64 } },
+              { type: "input_image", image_url: "data:" + safeMime + ";base64," + base64 },
               { type: "input_text", text: "Extract the conversation text from this screenshot. Format each message as 'Speaker: message text'. If speakers are unclear use 'Person A' and 'Person B'. Return only the conversation text." }
             ]}]
           })
