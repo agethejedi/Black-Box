@@ -56,7 +56,7 @@ async function runAnalysis(env, conversationId, rawText) {
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4o", input: ANALYSIS_PROMPT + "\n\nConversation:\n" + rawText })
+    body: JSON.stringify({ model: "gpt-4o", input: [{ role: "user", content: ANALYSIS_PROMPT + "\n\nConversation:\n" + rawText }] })
   })
   const ct = res.headers.get("content-type") || ""
   if (!ct.includes("application/json")) throw new Error("OpenAI non-JSON (" + res.status + ")")
