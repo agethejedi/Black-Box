@@ -35,7 +35,7 @@ async function runCollectionAnalysis(env, collectionId, conversations, version) 
     const res = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "gpt-4.5-preview", input: COLLECTION_PROMPT + "\n\nConversations:\n" + combined })
+      body: JSON.stringify({ model: "gpt-4o", input: COLLECTION_PROMPT + "\n\nConversations:\n" + combined })
     })
     const data = await res.json()
     const text = data.output?.[0]?.content?.[0]?.text || "{}"

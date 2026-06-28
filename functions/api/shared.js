@@ -71,7 +71,7 @@ export async function runAnalysis(env, conversationId, rawText) {
     method: "POST",
     headers: { "Authorization": `Bearer ${env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "gpt-4.5-preview",
+      model: "gpt-4o",
       input: ANALYSIS_PROMPT + "\n\nConversation:\n" + rawText
     })
   })

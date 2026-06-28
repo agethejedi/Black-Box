@@ -56,7 +56,7 @@ async function runAnalysis(env, conversationId, rawText) {
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: "gpt-4.5-preview", input: ANALYSIS_PROMPT + "\n\nConversation:\n" + rawText })
+    body: JSON.stringify({ model: "gpt-4o", input: ANALYSIS_PROMPT + "\n\nConversation:\n" + rawText })
   })
   const ct = res.headers.get("content-type") || ""
   if (!ct.includes("application/json")) throw new Error("OpenAI non-JSON (" + res.status + ")")
@@ -118,7 +118,7 @@ export async function onRequestPost(context) {
           method: "POST",
           headers: { "Authorization": "Bearer " + env.OPENAI_API_KEY, "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: "gpt-4.5-preview",
+            model: "gpt-4o",
             input: [{ type: "message", role: "user", content: [
               { type: "input_image", image_url: { url: "data:" + safeMime + ";base64," + base64 } },
               { type: "input_text", text: "Extract the conversation text from this screenshot. Format each message as 'Speaker: message text'. If speakers are unclear use 'Person A' and 'Person B'. Return only the conversation text." }
