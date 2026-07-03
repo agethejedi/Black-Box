@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Conversation, Utterance } from '../types'
 import SpeakerAvatar, { getColor } from '../components/SpeakerAvatar'
 import WaveformPlayer from '../components/WaveformPlayer'
@@ -46,7 +46,7 @@ function AnalysisPanel({ conv }: AnalysisPanelProps) {
       <div className="p-5 text-center">
         <div className="text-3xl mb-3">📊</div>
         <p className="text-sm font-medium text-white mb-1">No analysis yet</p>
-        <p className="text-xs" style={{ color: '#9494b8' }}>Click Analyze to run GPT-4.5 analysis</p>
+        <p className="text-xs" style={{ color: '#9494b8' }}>Click Analyze to run GPT-4o analysis</p>
       </div>
     )
   }
@@ -211,25 +211,92 @@ export default function ConversationDetail({ conversationId, onBack }: Props) {
   const [activeTab, setActiveTab] = useState<Tab>('transcript')
   const [showAll, setShowAll] = useState(false)
   const [analyzing, setAnalyzing] = useState(false)
+  const [analyzeStatus, setAnalyzeStatus] = useState('')
   const [error, setError] = useState('')
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     api.getConversation(conversationId)
       .then(d => setConv(d.conversation))
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
   }, [conversationId])
+
+  // Poll /api/transcribe until job completes then reload conversation
+  const startTranscribePoll = (jobId: string, convId: string) => {
+    setAnalyzeStatus('Transcribing audio…')
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `/api/transcribe?job_id=${jobId}&conv_id=${convId}`
+        )
+        const data = await res.json()
+
+        if (data.status === 'completed' || data.status === 'complete') {
+          if (pollRef.current) clearInterval(pollRef.current)
+          setAnalyzeStatus('Transcription complete — running analysis…')
+          // Reload conversation to get updated data
+          const updated = await api.getConversation(convId)
+          setConv(updated.conversation)
+          setAnalyzing(false)
+          setAnalyzeStatus('')
+        } else if (data.status === 'failed' || data.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current)
+          setError(data.error || 'Transcription failed')
+          setAnalyzing(false)
+          setAnalyzeStatus('')
+        } else {
+          // Still processing — update status label
+          setAnalyzeStatus(`Transcribing… (${data.status})`)
+        }
+      } catch (e: any) {
+        if (pollRef.current) clearInterval(pollRef.current)
+        setError(e.message)
+        setAnalyzing(false)
+        setAnalyzeStatus('')
+      }
+    }, 4000) // poll every 4 seconds
+  }
 
   const handleAnalyze = async () => {
     if (!conv) return
-    setAnalyzing(true); setError('')
+    setAnalyzing(true)
+    setError('')
+    setAnalyzeStatus('Submitting…')
     try {
       const r = await api.reanalyze(conversationId)
-      if (r.ok) setConv(c => c ? { ...c, analysis: r.analysis } : c)
+
+      // Audio recovery path — backend re-submitted to AssemblyAI
+      if (r.status === 'processing' && r.job_id) {
+        startTranscribePoll(r.job_id, conversationId)
+        return // polling takes over from here
+      }
+
+      // Direct completion — analysis came back immediately
+      if (r.ok && r.status === 'complete') {
+        // Reload full conversation to get analysis + transcript
+        const updated = await api.getConversation(conversationId)
+        setConv(updated.conversation)
+        setAnalyzing(false)
+        setAnalyzeStatus('')
+        return
+      }
+
+      // Legacy path — analysis returned inline
+      if (r.ok && r.analysis) {
+        setConv(c => c ? { ...c, analysis: r.analysis } : c)
+        setAnalyzing(false)
+        setAnalyzeStatus('')
+        return
+      }
+
+      throw new Error(r.error || 'Unknown error')
+
     } catch (e: any) {
       setError(e.message)
-    } finally {
       setAnalyzing(false)
+      setAnalyzeStatus('')
     }
   }
 
@@ -265,6 +332,10 @@ export default function ConversationDetail({ conversationId, onBack }: Props) {
 
   const fmtDuration = (s: number) => s > 0 ? `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}` : ''
 
+  const analyzeLabel = analyzing
+    ? (analyzeStatus || '⏳ Analyzing…')
+    : '↻ Analyze'
+
   return (
     <div className="flex flex-col h-screen">
       {/* Header */}
@@ -290,6 +361,11 @@ export default function ConversationDetail({ conversationId, onBack }: Props) {
               <span className="text-xs flex items-center gap-1 capitalize" style={{ color: '#9494b8' }}>
                 👤 {conv.source_type === 'audio' ? 'In Person' : conv.source_type.replace('_', ' ')}
               </span>
+              {analyzing && analyzeStatus && (
+                <span className="text-xs flex items-center gap-1" style={{ color: '#8b5cf6' }}>
+                  ⏳ {analyzeStatus}
+                </span>
+              )}
             </div>
           </div>
         </div>
@@ -297,7 +373,7 @@ export default function ConversationDetail({ conversationId, onBack }: Props) {
           <button onClick={handleAnalyze} disabled={analyzing}
             className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-50"
             style={{ background: '#8b5cf6', color: 'white' }}>
-            {analyzing ? '⏳ Analyzing…' : '🎙 Upload / Record'}
+            {analyzeLabel}
           </button>
           <button className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-all"
             style={{ background: '#1e1e35', border: '1px solid #2a2a45', color: '#9494b8' }}>
