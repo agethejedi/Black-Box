@@ -104,6 +104,12 @@ export const api = {
   coach: (draft: string, context?: string) =>
     req<{ report: any }>('/coach', { method: 'POST', body: JSON.stringify({ draft, context }) }),
 
+analyzeBundle: (conversation_ids: string[], title?: string) =>
+  req<{ conversation_id: string; status: string }>('/analyze/bundle', {
+    method: 'POST',
+    body: JSON.stringify({ conversation_ids, title }),
+  }),
+  
   // Collections
   listCollections:      () => req<{ collections: any[] }>('/collections'),
   getCollection:        (id: string) => req<{ collection: any }>(`/collections?id=${id}`),
