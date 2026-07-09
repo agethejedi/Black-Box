@@ -31,9 +31,17 @@ export const api = {
     req<{ status: string; analysis?: any }>(`/analyze?id=${id}`),
 
   reanalyze: (conversation_id: string) =>
-    req<{ ok: boolean; analysis: any }>('/reanalyze', {
+    // NOTE: returns { ok, status, analysis } for direct completion
+    // or { ok, status: 'processing', job_id } for audio recovery
+    fetch(`${BASE}/reanalyze`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ conversation_id }),
+    }).then(async res => {
+      const data = await res.json()
+      // Don't throw on processing status — let caller handle it
+      if (!res.ok && data.status !== 'processing') throw new Error(data.error || `HTTP ${res.status}`)
+      return data
     }),
 
   // Upload
@@ -46,7 +54,7 @@ export const api = {
     if (!ct.includes('application/json')) throw new Error(`Upload error (${res.status})`)
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || 'Upload failed')
-    return data as { upload_id: string; url: string; status: string }
+    return data as { conversation_id: string; status: string; openai_file_id?: string }
   },
 
   // Audio streaming URL
@@ -65,8 +73,28 @@ export const api = {
     return data as { job_id: string; conversation_id: string }
   },
 
-  getTranscribeStatus: (jobId: string) =>
-    req<{ status: string; transcript?: string; utterances?: any[]; speaker_count?: number }>(`/transcribe?job_id=${jobId}`),
+  // FIX: pass conv_id so transcribe.js can resolve the conversation
+  getTranscribeStatus: (jobId: string, convId?: string) => {
+    const params = convId
+      ? `/transcribe?job_id=${jobId}&conv_id=${convId}`
+      : `/transcribe?job_id=${jobId}`
+    return req<{
+      status: string
+      transcript?: string
+      utterances?: any[]
+      speaker_count?: number
+      conversation_id?: string
+      analysis_id?: string
+      analysis?: any
+    }>(params)
+  },
+
+  // Rename speakers in existing utterances — preserves timestamps + attribution
+  renameSpeakers: (conversation_id: string, mapping: Record<string, string>) =>
+    req<{ ok: boolean }>('/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'rename_speakers', conversation_id, mapping }),
+    }),
 
   // Search
   search: (query: string) =>
@@ -110,15 +138,19 @@ export async function pollAnalysis(
 
 export async function pollTranscription(
   jobId: string,
+  convId: string,                              // FIX: required so backend can save utterances
   onStatus?: (s: string) => void,
   max = 60
 ): Promise<any> {
   for (let i = 0; i < max; i++) {
     await new Promise(r => setTimeout(r, 3000))
-    const r = await api.getTranscribeStatus(jobId)
+    const r = await api.getTranscribeStatus(jobId, convId)
     onStatus?.(r.status)
-    if (r.status === 'completed') return r
+    // FIX: accept both 'complete' and 'completed'
+    if (r.status === 'complete' || r.status === 'completed') return r
     if (r.status === 'error' || r.status === 'failed') throw new Error('Transcription failed')
+    // Also handle transcribed (analysis failed but transcript saved)
+    if (r.status === 'transcribed') return r
   }
   throw new Error('Transcription timed out')
 }
