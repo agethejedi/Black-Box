@@ -10,7 +10,6 @@ const SOURCE_ICON: Record<string, string> = {
   audio: '🎙', screenshot: '🖼', text_paste: '📝', pdf: '📄', note: '📋'
 }
 
-// Safe chunked base64 for frontend HEIC conversion
 function toBase64(arrayBuffer: ArrayBuffer): string {
   const bytes = new Uint8Array(arrayBuffer)
   let binary = ''
@@ -91,7 +90,7 @@ function SpeakerVerify({ utterances, speakerCount, onConfirm, onCancel }: Speake
         <button onClick={onCancel} className="px-3 py-1.5 rounded-lg text-xs"
           style={{ background: '#16162a', border: '1px solid #2a2a45', color: '#9494b8' }}>Cancel</button>
         <button onClick={() => onConfirm(names)} className="px-4 py-1.5 rounded-lg text-xs font-medium"
-          style={{ background: '#8b5cf6', color: 'white' }}>Confirm & Analyze →</button>
+          style={{ background: '#8b5cf6', color: 'white' }}>Confirm & Save →</button>
       </div>
     </div>
   )
@@ -114,6 +113,8 @@ export default function ConversationsList({ onSelect }: Props) {
   const [pendingUtterances, setPendingUtterances] = useState<any[]|null>(null)
   const [pendingSpeakerCount, setPendingSpeakerCount] = useState(0)
   const [pendingTranscript, setPendingTranscript] = useState('')
+  // FIX 3: track convId through the full flow
+  const [pendingConvId, setPendingConvId] = useState<string|null>(null)
   const recRef = useRef<MediaRecorder|null>(null)
   const chunksRef = useRef<Blob[]>([])
   const timerRef = useRef<ReturnType<typeof setInterval>|null>(null)
@@ -161,7 +162,8 @@ export default function ConversationsList({ onSelect }: Props) {
       setStatus('Uploading…')
       const up = await api.uploadFile(uploadFile, 'screenshot')
       setStatus('Analyzing screenshot…')
-      await pollAnalysis(up.upload_id, setStatus)
+      // FIX: upload now returns conversation_id not upload_id
+      await pollAnalysis(up.conversation_id, setStatus)
       await loadConversations()
       setIngestMode(null); setStatus('')
     } catch (e: any) { setError(e.message) }
@@ -185,11 +187,14 @@ export default function ConversationsList({ onSelect }: Props) {
         try {
           const r = await api.transcribeAudio(blob, recordTitle || 'Recorded Conversation', recSeconds)
           setStatus('Transcribing with speaker detection…')
-          const result = await pollTranscription(r.job_id, setStatus)
+          // FIX 1: pass r.conversation_id so backend saves utterances correctly
+          const result = await pollTranscription(r.job_id, r.conversation_id, setStatus)
           setStatus('Verify speakers')
-          setPendingUtterances(result.utterances)
+          setPendingUtterances(result.utterances || [])
           setPendingSpeakerCount(result.speaker_count || 2)
-          setPendingTranscript(result.transcript)
+          setPendingTranscript(result.transcript || '')
+          // FIX 4: save convId for the speaker confirm step
+          setPendingConvId(result.conversation_id || r.conversation_id)
         } catch (e: any) { setError(e.message); setStatus('') }
         finally { setLoading(false) }
       }
@@ -208,19 +213,17 @@ export default function ConversationsList({ onSelect }: Props) {
     setIsRecording(false); setLoading(true)
   }, [])
 
+  // FIX 2: rename speakers in D1 instead of re-analyzing
+  // This preserves speaker timestamps, confidence scores, and attribution
   const handleSpeakerConfirm = async (nameMapping: Record<string,string>) => {
-    if (!pendingTranscript) return
-    setLoading(true); setStatus('Analyzing…'); setPendingUtterances(null)
-    let named = pendingTranscript
-    Object.entries(nameMapping).forEach(([orig, name]) => {
-      named = named.split(orig + ':').join(name + ':')
-    })
+    if (!pendingConvId) return
+    setLoading(true); setStatus('Saving speaker names…'); setPendingUtterances(null)
     try {
-      const parts = Object.values(nameMapping).filter(Boolean)
-      const r = await api.analyzeText({ title: recordTitle || 'Recorded Conversation', raw_text: named, participants: parts })
-      await pollAnalysis(r.conversation_id, setStatus)
+      await api.renameSpeakers(pendingConvId, nameMapping)
       await loadConversations()
-      setIngestMode(null); setRecordTitle(''); setRecSeconds(0); setStatus(''); setPendingTranscript('')
+      setIngestMode(null)
+      setRecordTitle(''); setRecSeconds(0)
+      setStatus(''); setPendingTranscript(''); setPendingConvId(null)
     } catch (e: any) { setError(e.message) }
     finally { setLoading(false) }
   }
@@ -270,7 +273,7 @@ export default function ConversationsList({ onSelect }: Props) {
           {pendingUtterances && (
             <SpeakerVerify utterances={pendingUtterances} speakerCount={pendingSpeakerCount}
               onConfirm={handleSpeakerConfirm}
-              onCancel={() => { setPendingUtterances(null); setStatus(''); setLoading(false) }} />
+              onCancel={() => { setPendingUtterances(null); setPendingConvId(null); setStatus(''); setLoading(false) }} />
           )}
           {!pendingUtterances && (
             <div className="flex flex-col items-center gap-5 py-4">
@@ -283,7 +286,7 @@ export default function ConversationsList({ onSelect }: Props) {
               )}
               {!loading && !isRecording && !status && (
                 <p className="text-xs text-center max-w-xs" style={{ color: '#9494b8' }}>
-                  Records the conversation, transcribes with speaker detection, then asks you to verify names before analysis.
+                  Records the conversation, transcribes with speaker detection, then asks you to verify names before saving.
                 </p>
               )}
               {!loading && (
@@ -325,11 +328,11 @@ export default function ConversationsList({ onSelect }: Props) {
               className="w-full rounded-lg px-3 py-2 text-sm outline-none"
               style={{ background: '#0f0f1a', border: '1px solid #2a2a45', color: '#f1f1f5' }} />
             <textarea value={textContent} onChange={e => setTextContent(e.target.value)}
-              placeholder="Paste conversation here. Format: Name: message" rows={10} 
+              placeholder="Paste conversation here. Format: Name: message" rows={10}
               className="w-full rounded-lg px-3 py-2 text-sm outline-none resize-none font-mono"
               style={{ background: '#0f0f1a', border: '1px solid #2a2a45', color: '#f1f1f5', lineHeight: 1.6 }} />
             <div className="flex items-center justify-between">
-              <p className="text-xs" style={{ color: '#4a4a6a' }}>GPT-4.5 will normalize and analyze.</p>
+              <p className="text-xs" style={{ color: '#4a4a6a' }}>GPT-4o will normalize and analyze.</p>
               <button onClick={handleTextAnalyze} disabled={loading || !textContent.trim()}
                 className="px-4 py-2 rounded-lg text-sm font-medium transition-all disabled:opacity-40"
                 style={{ background: '#8b5cf6', color: 'white' }}>
