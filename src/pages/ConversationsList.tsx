@@ -113,8 +113,12 @@ export default function ConversationsList({ onSelect }: Props) {
   const [pendingUtterances, setPendingUtterances] = useState<any[]|null>(null)
   const [pendingSpeakerCount, setPendingSpeakerCount] = useState(0)
   const [pendingTranscript, setPendingTranscript] = useState('')
-  // FIX 3: track convId through the full flow
   const [pendingConvId, setPendingConvId] = useState<string|null>(null)
+  // ── Bundle state ──────────────────────────────────────────────────────────
+  const [bundleFiles, setBundleFiles] = useState<File[]>([])
+  const [bundleMode, setBundleMode] = useState(false)
+  const [bundlePreviews, setBundlePreviews] = useState<string[]>([])
+
   const recRef = useRef<MediaRecorder|null>(null)
   const chunksRef = useRef<Blob[]>([])
   const timerRef = useRef<ReturnType<typeof setInterval>|null>(null)
@@ -127,6 +131,30 @@ export default function ConversationsList({ onSelect }: Props) {
   }
 
   useEffect(() => { loadConversations() }, [])
+
+  // Clean up object URLs on unmount
+  useEffect(() => {
+    return () => { bundlePreviews.forEach(url => URL.revokeObjectURL(url)) }
+  }, [bundlePreviews])
+
+  const addToBundle = (file: File) => {
+    const previewUrl = URL.createObjectURL(file)
+    setBundleFiles(f => [...f, file])
+    setBundlePreviews(p => [...p, previewUrl])
+  }
+
+  const removeFromBundle = (i: number) => {
+    URL.revokeObjectURL(bundlePreviews[i])
+    setBundleFiles(f => f.filter((_, fi) => fi !== i))
+    setBundlePreviews(p => p.filter((_, pi) => pi !== i))
+  }
+
+  const resetBundle = () => {
+    bundlePreviews.forEach(url => URL.revokeObjectURL(url))
+    setBundleFiles([])
+    setBundlePreviews([])
+    setBundleMode(false)
+  }
 
   const handleTextAnalyze = async () => {
     if (!textContent.trim()) return
@@ -142,6 +170,10 @@ export default function ConversationsList({ onSelect }: Props) {
   }
 
   const handleImageFile = async (file: File) => {
+    if (bundleMode) {
+      addToBundle(file)
+      return
+    }
     setLoading(true); setError(''); setStatus('Preparing image…')
     try {
       let uploadFile = file
@@ -162,10 +194,44 @@ export default function ConversationsList({ onSelect }: Props) {
       setStatus('Uploading…')
       const up = await api.uploadFile(uploadFile, 'screenshot')
       setStatus('Analyzing screenshot…')
-      // FIX: upload now returns conversation_id not upload_id
       await pollAnalysis(up.conversation_id, setStatus)
       await loadConversations()
       setIngestMode(null); setStatus('')
+    } catch (e: any) { setError(e.message) }
+    finally { setLoading(false) }
+  }
+
+  const handleBundleAnalyze = async () => {
+    if (!bundleFiles.length) return
+    setLoading(true); setError(''); setStatus('Processing bundle…')
+    try {
+      const convIds: string[] = []
+      for (let i = 0; i < bundleFiles.length; i++) {
+        setStatus(`Uploading screenshot ${i + 1} of ${bundleFiles.length}…`)
+        let uploadFile = bundleFiles[i]
+        const isHeic = uploadFile.type === 'image/heic' || uploadFile.type === 'image/heif'
+        if (isHeic) {
+          try {
+            const bitmap = await createImageBitmap(uploadFile)
+            const canvas = document.createElement('canvas')
+            canvas.width = bitmap.width; canvas.height = bitmap.height
+            canvas.getContext('2d')!.drawImage(bitmap, 0, 0)
+            const blob = await new Promise<Blob>((res, rej) =>
+              canvas.toBlob(b => b ? res(b) : rej(new Error('Canvas failed')), 'image/jpeg', 0.92))
+            uploadFile = new File([blob], uploadFile.name.replace(/\.heic$/i, '.jpg'), { type: 'image/jpeg' })
+          } catch {}
+        }
+        const up = await api.uploadFile(uploadFile, 'screenshot')
+        convIds.push(up.conversation_id)
+      }
+      setStatus('Extracting and combining conversation text…')
+      const r = await api.analyzeBundle(convIds)
+      setStatus('Analyzing combined conversation…')
+      await pollAnalysis(r.conversation_id, setStatus)
+      await loadConversations()
+      setIngestMode(null)
+      resetBundle()
+      setStatus('')
     } catch (e: any) { setError(e.message) }
     finally { setLoading(false) }
   }
@@ -187,13 +253,11 @@ export default function ConversationsList({ onSelect }: Props) {
         try {
           const r = await api.transcribeAudio(blob, recordTitle || 'Recorded Conversation', recSeconds)
           setStatus('Transcribing with speaker detection…')
-          // FIX 1: pass r.conversation_id so backend saves utterances correctly
           const result = await pollTranscription(r.job_id, r.conversation_id, setStatus)
           setStatus('Verify speakers')
           setPendingUtterances(result.utterances || [])
           setPendingSpeakerCount(result.speaker_count || 2)
           setPendingTranscript(result.transcript || '')
-          // FIX 4: save convId for the speaker confirm step
           setPendingConvId(result.conversation_id || r.conversation_id)
         } catch (e: any) { setError(e.message); setStatus('') }
         finally { setLoading(false) }
@@ -213,8 +277,6 @@ export default function ConversationsList({ onSelect }: Props) {
     setIsRecording(false); setLoading(true)
   }, [])
 
-  // FIX 2: rename speakers in D1 instead of re-analyzing
-  // This preserves speaker timestamps, confidence scores, and attribution
   const handleSpeakerConfirm = async (nameMapping: Record<string,string>) => {
     if (!pendingConvId) return
     setLoading(true); setStatus('Saving speaker names…'); setPendingUtterances(null)
@@ -344,122 +406,121 @@ export default function ConversationsList({ onSelect }: Props) {
         </div>
       )}
 
-     {/* Screenshot panel — paste to add mode */}
-{ingestMode === 'screenshot' && (
-  <div className="mb-6 rounded-xl p-5 animate-fade-in"
-    style={{ background: '#16162a', border: '1px solid rgba(45,212,191,0.25)' }}>
-    <div className="flex items-center justify-between mb-4">
-      <div>
-        <h3 className="text-sm font-semibold text-white">Upload Screenshot</h3>
-        <p className="text-xs mt-0.5" style={{ color: '#9494b8' }}>
-          {bundleMode
-            ? `${bundleFiles.length} screenshot${bundleFiles.length !== 1 ? 's' : ''} added — keep pasting to add more`
-            : 'Paste one screenshot or enable bundle mode for multi-screenshot conversations'}
-        </p>
-      </div>
-      <div className="flex items-center gap-2">
-        <button
-          onClick={() => { setBundleMode(m => !m); setBundleFiles([]) }}
-          className="px-3 py-1 rounded-lg text-xs transition-all"
-          style={{
-            background: bundleMode ? 'rgba(45,212,191,0.15)' : '#1e1e35',
-            border: `1px solid ${bundleMode ? '#2dd4bf' : '#2a2a45'}`,
-            color: bundleMode ? '#2dd4bf' : '#9494b8'
-          }}>
-          {bundleMode ? '✓ Bundle mode' : '+ Bundle mode'}
-        </button>
-        <button onClick={() => { setIngestMode(null); setBundleFiles([]); setBundleMode(false) }}
-          className="text-xs" style={{ color: '#9494b8' }}>✕</button>
-      </div>
-    </div>
-
-    {/* Bundle thumbnails */}
-    {bundleMode && bundleFiles.length > 0 && (
-      <div className="mb-3 flex gap-2 flex-wrap">
-        {bundleFiles.map((f, i) => (
-          <div key={i} className="relative group">
-            <img
-              src={URL.createObjectURL(f)}
-              alt={`Screenshot ${i + 1}`}
-              className="w-20 h-20 object-cover rounded-lg"
-              style={{ border: '1px solid #2a2a45' }}
-            />
-            <div className="absolute inset-0 flex items-center justify-center rounded-lg"
-              style={{ background: 'rgba(0,0,0,0.5)', opacity: 0 }}
-              onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
-              onMouseLeave={e => (e.currentTarget.style.opacity = '0')}>
-              <button
-                onClick={() => setBundleFiles(files => files.filter((_, fi) => fi !== i))}
-                className="text-white text-lg font-bold">✕</button>
+      {/* Screenshot panel — with bundle mode */}
+      {ingestMode === 'screenshot' && (
+        <div className="mb-6 rounded-xl p-5 animate-fade-in"
+          style={{ background: '#16162a', border: '1px solid rgba(45,212,191,0.25)' }}>
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="text-sm font-semibold text-white">Upload Screenshot</h3>
+              <p className="text-xs mt-0.5" style={{ color: '#9494b8' }}>
+                {bundleMode
+                  ? `${bundleFiles.length} screenshot${bundleFiles.length !== 1 ? 's' : ''} added — keep pasting to add more`
+                  : 'Paste one screenshot or enable bundle mode for multi-screenshot conversations'}
+              </p>
             </div>
-            <div className="absolute -top-1 -left-1 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold"
-              style={{ background: '#2dd4bf', color: '#000' }}>{i + 1}</div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => { setBundleMode(m => !m); if (bundleMode) resetBundle() }}
+                className="px-3 py-1 rounded-lg text-xs transition-all"
+                style={{
+                  background: bundleMode ? 'rgba(45,212,191,0.15)' : '#1e1e35',
+                  border: `1px solid ${bundleMode ? '#2dd4bf' : '#2a2a45'}`,
+                  color: bundleMode ? '#2dd4bf' : '#9494b8'
+                }}>
+                {bundleMode ? '✓ Bundle mode' : '+ Bundle mode'}
+              </button>
+              <button onClick={() => { setIngestMode(null); resetBundle() }}
+                className="text-xs" style={{ color: '#9494b8' }}>✕</button>
+            </div>
           </div>
-        ))}
-      </div>
-    )}
 
-    {/* Paste zone */}
-    <div tabIndex={0}
-      onPaste={async e => {
-        const item = Array.from(e.clipboardData?.items || []).find(i => i.type.startsWith('image/'))
-        if (!item) { setError('No image in clipboard'); return }
-        const file = item.getAsFile()
-        if (!file) return
-        setError('')
-        if (bundleMode) {
-          setBundleFiles(files => [...files, file])
-        } else {
-          await handleImageFile(file)
-        }
-      }}
-      className="flex flex-col items-center justify-center rounded-xl py-8 outline-none cursor-text mb-3"
-      style={{ border: '2px dashed rgba(45,212,191,0.3)', background: '#0f0f1a' }}>
-      <span className="text-3xl mb-2">📋</span>
-      <span className="text-sm font-medium" style={{ color: '#2dd4bf' }}>
-        {bundleMode ? 'Paste next screenshot' : 'Paste screenshot here'}
-      </span>
-      <span className="text-xs mt-1" style={{ color: '#4a4a6a' }}>Cmd+V / Ctrl+V</span>
-    </div>
+          {/* Bundle thumbnails */}
+          {bundleMode && bundleFiles.length > 0 && (
+            <div className="mb-4 flex gap-2 flex-wrap">
+              {bundlePreviews.map((src, i) => (
+                <div key={i} className="relative">
+                  <img src={src} alt={`Screenshot ${i + 1}`}
+                    className="w-20 h-20 object-cover rounded-lg"
+                    style={{ border: '1px solid #2a2a45' }} />
+                  <button
+                    onClick={() => removeFromBundle(i)}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold"
+                    style={{ background: '#ef4444', color: 'white' }}>✕</button>
+                  <div className="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold"
+                    style={{ background: '#2dd4bf', color: '#000' }}>{i + 1}</div>
+                </div>
+              ))}
+            </div>
+          )}
 
-    {/* File picker */}
-    <label className="flex items-center justify-center rounded-xl py-3 cursor-pointer transition-all mb-3"
-      style={{ border: '1px dashed #2a2a45' }}>
-      <span className="text-xs" style={{ color: '#9494b8' }}>📁 Choose file (PNG, JPG, WEBP, HEIC)</span>
-      <input type="file" accept="image/*,.heic,.heif"
-        multiple={bundleMode}
-        className="hidden"
-        onChange={async e => {
-          const files = Array.from(e.target.files || [])
-          if (!files.length) return
-          if (bundleMode) {
-            setBundleFiles(f => [...f, ...files])
-          } else {
-            await handleImageFile(files[0])
-          }
-        }}
-        disabled={loading} />
-    </label>
+          {/* Paste zone */}
+          <div tabIndex={0}
+            onPaste={async e => {
+              const item = Array.from(e.clipboardData?.items || []).find(i => i.type.startsWith('image/'))
+              if (!item) { setError('No image in clipboard'); return }
+              const file = item.getAsFile()
+              if (!file) return
+              setError('')
+              if (bundleMode) {
+                addToBundle(file)
+              } else {
+                await handleImageFile(file)
+              }
+            }}
+            className="flex flex-col items-center justify-center rounded-xl py-8 outline-none cursor-text mb-3"
+            style={{ border: '2px dashed rgba(45,212,191,0.3)', background: '#0f0f1a' }}>
+            <span className="text-3xl mb-2">📋</span>
+            <span className="text-sm font-medium" style={{ color: '#2dd4bf' }}>
+              {bundleMode ? 'Paste next screenshot' : 'Paste screenshot here'}
+            </span>
+            <span className="text-xs mt-1" style={{ color: '#4a4a6a' }}>Cmd+V / Ctrl+V</span>
+          </div>
 
-    {/* Bundle analyze button */}
-    {bundleMode && bundleFiles.length > 0 && !loading && (
-      <button onClick={handleBundleAnalyze}
-        className="w-full py-2.5 rounded-xl text-sm font-medium transition-all"
-        style={{ background: '#2dd4bf', color: '#000' }}>
-        Analyze {bundleFiles.length} Screenshot{bundleFiles.length !== 1 ? 's' : ''} as One Conversation →
-      </button>
-    )}
+          {/* File picker */}
+          <label className="flex items-center justify-center rounded-xl py-3 cursor-pointer transition-all mb-3"
+            style={{ border: '1px dashed #2a2a45' }}>
+            <span className="text-xs" style={{ color: '#9494b8' }}>
+              📁 Choose file{bundleMode ? 's' : ''} (PNG, JPG, WEBP, HEIC)
+            </span>
+            <input type="file" accept="image/*,.heic,.heif"
+              multiple={bundleMode}
+              className="hidden"
+              onChange={async e => {
+                const files = Array.from(e.target.files || [])
+                if (!files.length) return
+                if (bundleMode) {
+                  files.forEach(f => addToBundle(f))
+                } else {
+                  await handleImageFile(files[0])
+                }
+              }}
+              disabled={loading} />
+          </label>
 
-    {loading && (
-      <div className="flex items-center gap-2 justify-center mt-3">
-        <div className="w-4 h-4 rounded-full border-2 border-teal-400 border-t-transparent animate-spin" />
-        <p className="text-xs" style={{ color: '#2dd4bf' }}>{status}</p>
-      </div>
-    )}
-    {error && <p className="text-xs mt-2 text-center" style={{ color: '#ef4444' }}>{error}</p>}
-  </div>
-)}
+          {/* Bundle analyze button */}
+          {bundleMode && bundleFiles.length >= 2 && !loading && (
+            <button onClick={handleBundleAnalyze}
+              className="w-full py-2.5 rounded-xl text-sm font-medium transition-all mb-2"
+              style={{ background: '#2dd4bf', color: '#000' }}>
+              Analyze {bundleFiles.length} Screenshots as One Conversation →
+            </button>
+          )}
+          {bundleMode && bundleFiles.length === 1 && !loading && (
+            <p className="text-xs text-center mb-2" style={{ color: '#4a4a6a' }}>
+              Add at least one more screenshot to analyze as a bundle
+            </p>
+          )}
 
+          {loading && (
+            <div className="flex items-center gap-2 justify-center mt-3">
+              <div className="w-4 h-4 rounded-full border-2 border-teal-400 border-t-transparent animate-spin" />
+              <p className="text-xs" style={{ color: '#2dd4bf' }}>{status}</p>
+            </div>
+          )}
+          {error && <p className="text-xs mt-2 text-center" style={{ color: '#ef4444' }}>{error}</p>}
+        </div>
+      )}
 
       {/* Conversation list */}
       {conversations.length === 0 ? (
