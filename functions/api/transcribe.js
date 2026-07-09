@@ -1,5 +1,5 @@
 // POST /api/transcribe — upload audio to AssemblyAI with diarization
-// GET  /api/transcribe?job_id=xxx&conv_id=xxx — poll + trigger analysis when done
+// GET  /api/transcribe?job_id=xxx&conv_id=xxx — poll + save utterances + trigger analysis
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -91,7 +91,37 @@ async function runAnalysis(env, conversationId, rawText) {
     "UPDATE conversations SET analysis_id = ?, status = 'complete', updated_at = ? WHERE id = ?"
   ).bind(analysisId, now, conversationId).run()
 
-  return analysisId
+  return { analysisId, analysis }
+}
+
+// ── Save utterances to D1 ─────────────────────────────────────────────────
+async function saveUtterances(env, conversationId, rawUtterances) {
+  if (!rawUtterances || !rawUtterances.length) return
+
+  // Clear any existing utterances for this conversation
+  await env.DB.prepare(
+    "DELETE FROM utterances WHERE conversation_id = ?"
+  ).bind(conversationId).run()
+
+  // Insert each utterance
+  for (let i = 0; i < rawUtterances.length; i++) {
+    const u = rawUtterances[i]
+    await env.DB.prepare(`
+      INSERT INTO utterances
+        (id, conversation_id, speaker_label, speaker_name, content, start_ms, end_ms, confidence, sequence)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      crypto.randomUUID(),
+      conversationId,
+      u.speaker || "A",                          // AssemblyAI label: "A", "B", etc.
+      "Speaker " + (u.speaker || "A"),            // display name
+      u.text || "",
+      u.start || 0,
+      u.end || 0,
+      u.confidence || 1.0,
+      i
+    ).run()
+  }
 }
 
 // ── POST — submit audio to AssemblyAI ─────────────────────────────────────
@@ -128,7 +158,7 @@ export async function onRequestPost(context) {
     if (!uploadRes.ok) return json({ error: "AssemblyAI upload failed", detail: await uploadRes.text() }, 502)
     const { upload_url } = await uploadRes.json()
 
-    // Submit transcription job
+    // Submit transcription job with speaker diarization
     const transcriptRes = await fetch("https://api.assemblyai.com/v2/transcript", {
       method: "POST",
       headers: { "authorization": env.ASSEMBLYAI_API_KEY, "content-type": "application/json" },
@@ -167,7 +197,7 @@ export async function onRequestPost(context) {
   }
 }
 
-// ── GET — poll AssemblyAI, save transcript, trigger analysis when ready ────
+// ── GET — poll AssemblyAI, save utterances + transcript, trigger analysis ──
 export async function onRequestGet(context) {
   const { request, env } = context
   if (!env.ASSEMBLYAI_API_KEY) return json({ error: "ASSEMBLYAI_API_KEY not configured" }, 503)
@@ -184,6 +214,7 @@ export async function onRequestGet(context) {
     if (!pollRes.ok) return json({ error: "Poll failed" }, 502)
     const transcript = await pollRes.json()
 
+    // Failed
     if (transcript.status === "error") {
       if (convId && env.DB) {
         await env.DB.prepare(
@@ -193,72 +224,102 @@ export async function onRequestGet(context) {
       return json({ status: "failed", error: transcript.error })
     }
 
-    // Still processing
+    // Still processing — return current status for frontend poll loop
     if (transcript.status !== "completed") {
       return json({ status: transcript.status })
     }
 
-    // Transcription complete — format utterances
-    const utterances = (transcript.utterances || []).map(u => ({
+    // ── Transcription complete ────────────────────────────────────────────
+
+    // Raw utterances from AssemblyAI (have speaker label A/B, timestamps)
+    const rawUtterances = transcript.utterances || []
+
+    // Formatted for display and analysis
+    const formattedUtterances = rawUtterances.map(u => ({
       speaker: "Speaker " + u.speaker,
+      speaker_label: u.speaker,
       text: u.text,
       start_ms: u.start,
       end_ms: u.end,
       confidence: u.confidence,
     }))
-    const formattedTranscript = utterances.map(u => `${u.speaker}: ${u.text}`).join("\n")
 
-    // Resolve convId from KV if not passed
+    const formattedTranscript = formattedUtterances
+      .map(u => `${u.speaker}: ${u.text}`)
+      .join("\n")
+
+    const speakerCount = new Set(rawUtterances.map(u => u.speaker)).size
+
+    // Resolve convId from KV if not passed as query param
     let resolvedConvId = convId
     if (!resolvedConvId && env.BLACKBOX_KV) {
       const stored = await env.BLACKBOX_KV.get(`transcribe:${jobId}`, "json")
       resolvedConvId = stored?.convId || null
     }
 
-    // Save transcript to D1
-    if (resolvedConvId && env.DB) {
-      await env.DB.prepare(
-        "UPDATE conversations SET raw_text = ?, status = 'transcribed', updated_at = ? WHERE id = ?"
-      ).bind(formattedTranscript, new Date().toISOString(), resolvedConvId).run()
+    if (!resolvedConvId || !env.DB) {
+      return json({
+        status: "complete",
+        transcript: formattedTranscript,
+        utterances: formattedUtterances,
+        speaker_count: speakerCount,
+      })
+    }
 
-      // Trigger analysis now — in this request, not waitUntil
-      if (env.OPENAI_API_KEY) {
-        try {
-          await env.DB.prepare(
-            "UPDATE conversations SET status = 'analyzing', updated_at = ? WHERE id = ?"
-          ).bind(new Date().toISOString(), resolvedConvId).run()
+    // Save transcript text to conversations
+    await env.DB.prepare(
+      "UPDATE conversations SET raw_text = ?, status = 'transcribed', updated_at = ? WHERE id = ?"
+    ).bind(formattedTranscript, new Date().toISOString(), resolvedConvId).run()
 
-          const analysisId = await runAnalysis(env, resolvedConvId, formattedTranscript)
-          return json({
-            status: "complete",
-            conversation_id: resolvedConvId,
-            analysis_id: analysisId,
-            transcript: formattedTranscript,
-            utterances,
-            speaker_count: new Set(utterances.map(u => u.speaker)).size,
-          })
-        } catch (err) {
-          console.error("Analysis after transcription failed:", String(err))
-          await env.DB.prepare(
-            "UPDATE conversations SET status = 'transcribed', updated_at = ? WHERE id = ?"
-          ).bind(new Date().toISOString(), resolvedConvId).run()
-          // Return transcribed so frontend can retry via /api/analyze
-          return json({
-            status: "transcribed",
-            conversation_id: resolvedConvId,
-            transcript: formattedTranscript,
-            utterances,
-          })
-        }
+    // ── Save utterances to D1 — this is what drives the transcript tab ───
+    await saveUtterances(env, resolvedConvId, rawUtterances)
+
+    // ── Run analysis synchronously ────────────────────────────────────────
+    if (env.OPENAI_API_KEY) {
+      try {
+        await env.DB.prepare(
+          "UPDATE conversations SET status = 'analyzing', updated_at = ? WHERE id = ?"
+        ).bind(new Date().toISOString(), resolvedConvId).run()
+
+        const { analysisId, analysis } = await runAnalysis(env, resolvedConvId, formattedTranscript)
+
+        return json({
+          status: "complete",
+          conversation_id: resolvedConvId,
+          analysis_id: analysisId,
+          transcript: formattedTranscript,
+          utterances: formattedUtterances,
+          speaker_count: speakerCount,
+          analysis: {
+            quality_score: analysis.quality_score,
+            outcome: analysis.outcome,
+            key_insights: analysis.key_insights,
+            coaching_recommendations: analysis.coaching_recommendations,
+          }
+        })
+      } catch (err) {
+        console.error("Analysis after transcription failed:", String(err))
+        // Analysis failed but transcript + utterances are saved — return transcribed
+        await env.DB.prepare(
+          "UPDATE conversations SET status = 'transcribed', updated_at = ? WHERE id = ?"
+        ).bind(new Date().toISOString(), resolvedConvId).run()
+        return json({
+          status: "transcribed",
+          conversation_id: resolvedConvId,
+          transcript: formattedTranscript,
+          utterances: formattedUtterances,
+          speaker_count: speakerCount,
+          error: "Analysis failed — transcript saved. Click Analyze to retry."
+        })
       }
     }
 
     return json({
-      status: "completed",
+      status: "transcribed",
       conversation_id: resolvedConvId,
       transcript: formattedTranscript,
-      utterances,
-      speaker_count: new Set(utterances.map(u => u.speaker)).size,
+      utterances: formattedUtterances,
+      speaker_count: speakerCount,
     })
 
   } catch (err) {
