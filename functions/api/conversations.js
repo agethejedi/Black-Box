@@ -1,9 +1,11 @@
-// GET /api/conversations — list or get one conversation
-// DELETE /api/conversations?id=uuid
+// GET /api/conversations       — list conversations
+// GET /api/conversations?id=   — get single conversation with utterances + analysis
+// POST /api/conversations      — actions (rename_speakers)
+// DELETE /api/conversations?id= — delete conversation
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 }
 const json = (d, s = 200) => new Response(JSON.stringify(d), {
@@ -52,6 +54,49 @@ export async function onRequestGet(context) {
     `).all()
     return json({ conversations: result.results || [] })
   } catch (err) { return json({ error: String(err) }, 500) }
+}
+
+export async function onRequestPost(context) {
+  const { request, env } = context
+  if (!env.DB) return json({ error: "DB not configured" }, 503)
+
+  let body
+  try { body = await request.json() } catch { return json({ error: "Invalid JSON" }, 400) }
+
+  // ── Rename speakers — preserves utterances, timestamps, attribution ──────
+  if (body.action === "rename_speakers") {
+    const { conversation_id, mapping } = body
+    if (!conversation_id || !mapping) {
+      return json({ error: "conversation_id and mapping required" }, 400)
+    }
+    try {
+      // Update speaker_name for each label in utterances
+      for (const [label, name] of Object.entries(mapping)) {
+        if (!name || !label) continue
+        await env.DB.prepare(
+          "UPDATE utterances SET speaker_name = ? WHERE conversation_id = ? AND speaker_label = ?"
+        ).bind(String(name), conversation_id, String(label)).run()
+      }
+
+      // Rebuild raw_text from updated utterances
+      const utterances = await env.DB.prepare(
+        "SELECT speaker_name, content FROM utterances WHERE conversation_id = ? ORDER BY sequence"
+      ).bind(conversation_id).all()
+
+      if (utterances.results?.length) {
+        const newRawText = utterances.results
+          .map(u => `${u.speaker_name}: ${u.content}`)
+          .join("\n")
+        await env.DB.prepare(
+          "UPDATE conversations SET raw_text = ?, updated_at = ? WHERE id = ?"
+        ).bind(newRawText, new Date().toISOString(), conversation_id).run()
+      }
+
+      return json({ ok: true, conversation_id })
+    } catch (err) { return json({ error: String(err) }, 500) }
+  }
+
+  return json({ error: "Unknown action" }, 400)
 }
 
 export async function onRequestDelete(context) {
