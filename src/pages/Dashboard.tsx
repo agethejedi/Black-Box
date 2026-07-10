@@ -249,7 +249,7 @@ export default function Dashboard({ onNav }: Props) {
       </div>
 
       {/* Top Topics */}
-      {!loading && stats?.topTopics?.length > 0 && (
+      {!loading && stats && (stats.topTopics?.length ?? 0) > 0 && (
         <div className="rounded-xl p-5 mb-6" style={{ background: '#16162a', border: '1px solid #2a2a45' }}>
           <h2 className="text-sm font-medium text-white mb-3">Recurring Topics</h2>
           <div className="flex flex-wrap gap-2">
@@ -268,7 +268,7 @@ export default function Dashboard({ onNav }: Props) {
       )}
 
       {/* Recent outcome distribution */}
-      {!loading && stats?.recentOutcomes?.length > 0 && (
+      {!loading && stats && (stats.recentOutcomes?.length ?? 0) > 0 && (
         <div className="rounded-xl p-5" style={{ background: '#16162a', border: '1px solid #2a2a45' }}>
           <h2 className="text-sm font-medium text-white mb-3">Recent Outcomes</h2>
           <div className="flex gap-2 flex-wrap">
