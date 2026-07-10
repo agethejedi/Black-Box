@@ -172,7 +172,7 @@ export async function onRequestPost(context) {
     if (missing !== -1) return json({ error: `Conversation ${conversation_ids[missing]} not found` }, 404)
 
     // Extract text from each screenshot in order
-    const textSegments: string[] = []
+    const textSegments = []
     for (let i = 0; i < conversations.length; i++) {
       const conv = conversations[i]
       try {
